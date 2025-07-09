@@ -1,2 +1,2 @@
-# gep-demo
+# gcp-demo
 GCP Integration demo
