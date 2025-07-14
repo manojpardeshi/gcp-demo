@@ -7,10 +7,10 @@ This document provides a step-by-step guide to configure the integration between
 1.  **Salesforce**: A Record-Triggered Flow detects a record change (create/update).
 2.  **Apex Callout**: The Flow calls an Apex class that makes an HTTP POST request.
 3.  **Google Cloud Function**: An HTTP-triggered function receives the request from Salesforce.
-4.  **Google Secret Manager**: The function securely retrieves credentials for Salesforce and SendGrid.
+4.  **Google Secret Manager**: The function securely retrieves credentials for Salesforce and the Gmail API.
 5.  **Salesforce API**: The function uses the record ID to fetch the full record details from Salesforce.
 6.  **Google BigQuery**: The function inserts the record data into a BigQuery table.
-7.  **SendGrid**: Upon successful insertion, the function sends an email notification.
+7.  **Gmail API**: Upon successful insertion, the function sends an email notification using a specified Gmail account.
 
 ---
 
@@ -26,18 +26,52 @@ This document provides a step-by-step guide to configure the integration between
     *   `Industry`: STRING
     *   `Phone`: STRING
     *   `CreatedDate`: TIMESTAMP
+    
+### 1.2. Enable Gmail API and Create Credentials
 
-### 1.2. Configure Secret Manager
+1.  In the GCP Console, navigate to **"APIs & Services" -> "Library"**.
+2.  Search for **"Gmail API"** and click **"Enable"**.
+3.  Go to **"APIs & Services" -> "Credentials"**.
+4.  Click **"+ CREATE CREDENTIALS"** and select **"OAuth client ID"**.
+5.  If prompted, configure the **"OAuth consent screen"**.
+    *   **User Type**: Select **"External"**.
+    *   Fill in the required app information (app name, user support email, developer contact).
+    *   On the "Scopes" page, you don't need to add any scopes.
+    *   On the "Test users" page, add the email address of the Gmail account you want to send emails from.
+6.  Go back to creating the OAuth client ID.
+    *   **Application type**: Select **"Desktop app"**.
+    *   Give it a name (e.g., "GCP Salesforce Notifier").
+    *   Click **"Create"**.
+7.  A window will appear with your "Client ID" and "Client Secret". Click **"DOWNLOAD JSON"** and save this file as `credentials.json` in the root of your project directory.
+
+### 1.3. Generate a Gmail Refresh Token
+
+You need to authorize the application to send emails on your behalf. The provided `get_gmail_token.py` script simplifies this process.
+
+1.  Make sure you have the required Python libraries installed locally:
+    ```bash
+    pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+    ```
+2.  Run the script from your terminal:
+    ```bash
+    python get_gmail_token.py
+    ```
+3.  Your web browser will open, asking you to log in to your Google account and grant permission for the app to "Send email on your behalf". **Grant this permission.**
+4.  After you grant permission, the script will print your **Refresh Token** in the terminal. **Copy this value.**
+
+### 1.4. Configure Secret Manager
 
 1.  In the GCP Console, navigate to **Secret Manager**.
-2.  Enable the API if it's not already enabled.
-3.  Create the following secrets, storing the corresponding values:
+2.  Create the following secrets, storing the corresponding values:
     *   `salesforce-username`: Your Salesforce username.
     *   `salesforce-password`: Your Salesforce password concatenated with your security token.
     *   `salesforce-token`: Your Salesforce security token.
-    *   `sendgrid-api-key`: Your SendGrid API key.
+    *   `salesforce-instance-url`: Your custom Salesforce domain URL (e.g., `https://orgfarm-6a25093d73-dev-ed.develop.my.salesforce.com`).
+    *   `gmail-client-id`: The `client_id` from your `credentials.json` file.
+    *   `gmail-client-secret`: The `client_secret` from your `credentials.json` file.
+    *   `gmail-refresh-token`: The refresh token you generated in the previous step.
 
-### 1.3. Deploy the Cloud Function
+### 1.5. Deploy the Cloud Function
 
 1.  Ensure you have the `gcloud` CLI installed and authenticated.
 2.  Navigate to the root directory of this project (`gcp-demo`).
@@ -49,7 +83,7 @@ gcloud functions deploy salesforce-trigger \
 --trigger-http \
 --source cloud_function \
 --entry-point salesforce_trigger \
---set-env-vars GCP_PROJECT=your-gcp-project-id,BIGQUERY_DATASET=your-dataset-id,BIGQUERY_TABLE=your-table-id,FROM_EMAIL=sender@example.com,TO_EMAILS=recipient1@example.com
+--set-env-vars GCP_PROJECT=singular-arbor-465514-r0,BIGQUERY_DATASET=singular-arbor-465514-r0.salesforce_data,BIGQUERY_TABLE=singular-arbor-465514-r0.salesforce_data.accounts,FROM_EMAIL=manojjobus@gmail.com,TO_EMAILS=manojpardeshi@gmail.com
 ```
 4. After deployment, **copy the trigger URL**. You will need it for the Salesforce setup.
 
@@ -74,8 +108,21 @@ gcloud functions deploy salesforce-trigger \
 
 ```apex
 public class GCPNotifier {
+
+    // This is the method that the Flow will call. It must be an InvocableMethod.
+    // It cannot do the callout directly because of the "uncommitted work" error.
+    // Its only job is to call the future method.
     @InvocableMethod(label='Notify GCP Endpoint' description='Sends a record ID to the GCP function.')
-    public static void notifyGCP(List<String> recordIds) {
+    public static void startCallout(List<String> recordIds) {
+        // Call the future method to perform the callout in a separate transaction.
+        performCallout(recordIds);
+    }
+
+    // This is the future method that performs the actual HTTP callout.
+    // It runs asynchronously, which solves the "uncommitted work pending" error.
+    // It cannot be called directly by a Flow, which is why we need the method above.
+    @future(callout=true)
+    public static void performCallout(List<String> recordIds) {
         if (recordIds == null || recordIds.isEmpty()) {
             return;
         }
@@ -107,17 +154,38 @@ public class GCPNotifier {
 ```apex
 @isTest
 private class GCPNotifierTest {
+
+    // By implementing the HttpCalloutMock interface, we can create a custom mock response.
+    // This is more robust than using StaticResourceCalloutMock.
+    public class MockHttpResponse implements HttpCalloutMock {
+        public HttpResponse respond(HttpRequest req) {
+            // Create a fake response
+            HttpResponse res = new HttpResponse();
+            res.setHeader('Content-Type', 'application/json');
+            res.setBody('{"status":"success"}');
+            res.setStatusCode(200);
+            return res;
+        }
+    }
+
     @isTest
     static void testNotifyGCP() {
-        StaticResourceCalloutMock mock = new StaticResourceCalloutMock();
-        mock.setStatusCode(200);
-        mock.setHeader('Content-Type', 'application/json');
-        mock.setBody('{"status":"success"}');
-        Test.setMock(HttpCalloutMock.class, mock);
+        // Set the mock callout class
+        Test.setMock(HttpCalloutMock.class, new MockHttpResponse());
+
+        // The record ID to be sent in the test
         List<String> recordIds = new List<String>{'001xx000003DUM1AAG'};
+        
+        // Start the test context
         Test.startTest();
-        GCPNotifier.notifyGCP(recordIds);
+        
+        // Call the InvocableMethod, which will in turn call the future method.
+        GCPNotifier.startCallout(recordIds);
+        
+        // Stop the test context
         Test.stopTest();
+
+        // By this point, the test has passed if no exceptions were thrown.
     }
 }
 ```

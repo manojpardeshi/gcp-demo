@@ -1,9 +1,12 @@
 import os
 import xml.etree.ElementTree as ET
 from google.cloud import bigquery, secretmanager
-from salesforce_api import Salesforce
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+from simple_salesforce import Salesforce
+import base64
+from email.mime.text import MIMEText
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
 
 def salesforce_trigger(request):
     """
@@ -26,14 +29,19 @@ def salesforce_trigger(request):
     # Placeholder for secret fetching logic
     secrets = get_secrets()
     sf_credentials = secrets['salesforce']
-    sendgrid_api_key = secrets['sendgrid_api_key']
+    gmail_credentials = secrets['gmail']
 
     # 3. Fetch detailed record data from Salesforce
     # ---------------------------------------------
     # Use the record ID to query the Salesforce API for the full record.
 
     # Placeholder for Salesforce API call
-    sf = Salesforce(username=sf_credentials['username'], password=sf_credentials['password'], security_token=sf_credentials['token'])
+    sf = Salesforce(
+        username=sf_credentials['username'], 
+        password=sf_credentials['password'], 
+        security_token=sf_credentials['token'],
+        instance_url=sf_credentials['instance_url']
+    )
     salesforce_data = sf.Account.get(record_id) # Example for 'Account' object
 
     if not salesforce_data:
@@ -51,7 +59,7 @@ def salesforce_trigger(request):
     # After a successful insertion, send a confirmation email.
 
     # Placeholder for email sending logic
-    send_email_notification(sendgrid_api_key, salesforce_data)
+    send_email_notification(gmail_credentials, salesforce_data)
 
     return 'Successfully processed Salesforce notification.', 200
 
@@ -93,7 +101,10 @@ def get_secrets():
         "salesforce_username": "salesforce-username",
         "salesforce_password": "salesforce-password",
         "salesforce_token": "salesforce-token",
-        "sendgrid_api_key": "sendgrid-api-key"
+        "salesforce_instance_url": "salesforce-instance-url",
+        "gmail_client_id": "gmail-client-id",
+        "gmail_client_secret": "gmail-client-secret",
+        "gmail_refresh_token": "gmail-refresh-token"
     }
 
     secrets = {}
@@ -109,13 +120,24 @@ def get_secrets():
             secrets[key] = response.payload.data.decode("UTF-8")
 
         print("Successfully fetched all secrets.")
+        # Add debug logging to verify the values being used.
+        print(f"--- Salesforce Auth Details ---")
+        print(f"Using Username: {secrets.get('salesforce_username')}")
+        print(f"Using Instance URL: {secrets.get('salesforce_instance_url')}")
+        print(f"Password and Token are not logged for security.")
+        print(f"-------------------------------")
         return {
             "salesforce": {
                 "username": secrets["salesforce_username"],
                 "password": secrets["salesforce_password"],
-                "token": secrets["salesforce_token"]
+                "token": secrets["salesforce_token"],
+                "instance_url": secrets["salesforce_instance_url"]
             },
-            "sendgrid_api_key": secrets["sendgrid_api_key"]
+            "gmail": {
+                "client_id": secrets["gmail_client_id"],
+                "client_secret": secrets["gmail_client_secret"],
+                "refresh_token": secrets["gmail_refresh_token"]
+            }
         }
     except Exception as e:
         print(f"Error fetching secrets: {e}")
@@ -153,37 +175,45 @@ def insert_into_bigquery(data):
     except Exception as e:
         print(f"Error inserting data into BigQuery: {e}")
 
-def send_email_notification(api_key, data):
+def send_email_notification(credentials_info, data):
     """
-    Sends an email using the SendGrid API.
+    Sends an email using the Gmail API.
     """
-    # Initialize the SendGrid client.
-    sg = SendGridAPIClient(api_key)
-
-    # Get email details from environment variables.
-    from_email = os.environ.get("FROM_EMAIL")
-    to_emails = os.environ.get("TO_EMAILS", "").split(",")
-
-    # Construct the email message.
-    subject = f"New Salesforce Record Created/Updated: {data.get('Name', 'N/A')}"
-    html_content = f"""
-    <h3>A Salesforce record has been processed and added to BigQuery.</h3>
-    <p><strong>Record Name:</strong> {data.get('Name', 'N/A')}</p>
-    <p><strong>Record ID:</strong> {data.get('Id', 'N/A')}</p>
-    <p><strong>Industry:</strong> {data.get('Industry', 'N/A')}</p>
-    <p><strong>Phone:</strong> {data.get('Phone', 'N/A')}</p>
-    """
-
-    message = Mail(
-        from_email=from_email,
-        to_emails=to_emails,
-        subject=subject,
-        html_content=html_content
-    )
-
     try:
-        # Send the email.
-        response = sg.send(message)
-        print(f"Email sent with status code: {response.status_code}")
+        # Create credentials from the info fetched from Secret Manager
+        creds = Credentials.from_authorized_user_info(info={
+            "client_id": credentials_info["client_id"],
+            "client_secret": credentials_info["client_secret"],
+            "refresh_token": credentials_info["refresh_token"],
+            "token_uri": "https://oauth2.googleapis.com/token"
+        })
+
+        # Build the Gmail service
+        service = build('gmail', 'v1', credentials=creds)
+
+        # Get email details from environment variables
+        sender_email = os.environ.get("FROM_EMAIL")
+        recipient_emails = os.environ.get("TO_EMAILS", "").split(",")
+
+        # Create the email message
+        message = MIMEText(f"""
+        <h3>A Salesforce record has been processed and added to BigQuery.</h3>
+        <p><strong>Record Name:</strong> {data.get('Name', 'N/A')}</p>
+        <p><strong>Record ID:</strong> {data.get('Id', 'N/A')}</p>
+        <p><strong>Industry:</strong> {data.get('Industry', 'N/A')}</p>
+        <p><strong>Phone:</strong> {data.get('Phone', 'N/A')}</p>
+        """, 'html')
+        
+        message['to'] = ", ".join(recipient_emails)
+        message['from'] = sender_email
+        message['subject'] = f"New Salesforce Record Created/Updated: {data.get('Name', 'N/A')}"
+
+        # Encode the message in base64
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        create_message = {'raw': encoded_message}
+
+        # Send the email
+        send_message = (service.users().messages().send(userId="me", body=create_message).execute())
+        print(f'Message Id: {send_message["id"]}')
     except Exception as e:
-        print(f"Error sending email: {e}")
+        print(f"An error occurred while sending email: {e}")
