@@ -83,7 +83,7 @@ gcloud functions deploy salesforce-trigger \
 --trigger-http \
 --source cloud_function \
 --entry-point salesforce_trigger \
---set-env-vars GCP_PROJECT=singular-arbor-465514-r0,BIGQUERY_DATASET=singular-arbor-465514-r0.salesforce_data,BIGQUERY_TABLE=singular-arbor-465514-r0.salesforce_data.accounts,FROM_EMAIL=manojjobus@gmail.com,TO_EMAILS=manojpardeshi@gmail.com
+--set-env-vars GCP_PROJECT=<Your GCP Project ID>,BIGQUERY_DATASET=<Your BIGQUERY DATASET ID>,BIGQUERY_TABLE=<Your Table ID>,FROM_EMAIL=<Your email id>,TO_EMAILS=<TO Email id>
 ```
 4. After deployment, **copy the trigger URL**. You will need it for the Salesforce setup.
 
